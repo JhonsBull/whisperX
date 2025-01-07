@@ -3,7 +3,7 @@ Forced Alignment with Whisper
 C. Max Bain
 """
 from dataclasses import dataclass
-from typing import Iterable, Optional, Union, List
+from typing import Iterable, Union, List, Callable
 
 import numpy as np
 import pandas as pd
@@ -53,19 +53,12 @@ DEFAULT_ALIGN_MODELS_HF = {
     "hi": "theainerd/Wav2Vec2-large-xlsr-hindi",
     "ca": "softcatala/wav2vec2-large-xlsr-catala",
     "ml": "gvs/wav2vec2-large-xlsr-malayalam",
-    "no": "NbAiLab/nb-wav2vec2-1b-bokmaal-v2",
-    "nn": "NbAiLab/nb-wav2vec2-1b-nynorsk",
-    "sk": "comodoro/wav2vec2-xls-r-300m-sk-cv8",
-    "sl": "anton-l/wav2vec2-large-xlsr-53-slovenian",
-    "hr": "classla/wav2vec2-xls-r-parlaspeech-hr",
-    "ro": "gigant/romanian-wav2vec2",
-    "eu": "stefan-it/wav2vec2-large-xlsr-53-basque",
-    "gl": "ifrz/wav2vec2-large-xlsr-galician",
-    "ka": "xsway/wav2vec2-large-xlsr-georgian",
+    "no": "NbAiLab/nb-wav2vec2-1b-bokmaal",
+    "nn": "NbAiLab/nb-wav2vec2-300m-nynorsk",
 }
 
 
-def load_align_model(language_code: str, device: str, model_name: Optional[str] = None, model_dir=None):
+def load_align_model(language_code, device, model_name=None, model_dir=None):
     if model_name is None:
         # use default model
         if language_code in DEFAULT_ALIGN_MODELS_TORCH:
@@ -85,8 +78,8 @@ def load_align_model(language_code: str, device: str, model_name: Optional[str] 
         align_dictionary = {c.lower(): i for i, c in enumerate(labels)}
     else:
         try:
-            processor = Wav2Vec2Processor.from_pretrained(model_name, cache_dir=model_dir)
-            align_model = Wav2Vec2ForCTC.from_pretrained(model_name, cache_dir=model_dir)
+            processor = Wav2Vec2Processor.from_pretrained(model_name)
+            align_model = Wav2Vec2ForCTC.from_pretrained(model_name)
         except Exception as e:
             print(e)
             print(f"Error loading model from huggingface, check https://huggingface.co/models for finetuned wav2vec2.0 models")
@@ -111,6 +104,7 @@ def align(
     return_char_alignments: bool = False,
     print_progress: bool = False,
     combined_progress: bool = False,
+    on_progress: Callable[[int, int], None] = None
 ) -> AlignedTranscriptionResult:
     """
     Align phoneme recognition predictions to known transcription.
@@ -137,6 +131,9 @@ def align(
             base_progress = ((sdx + 1) / total_segments) * 100
             percent_complete = (50 + base_progress / 2) if combined_progress else base_progress
             print(f"Progress: {percent_complete:.2f}%...")
+
+        if on_progress:
+            on_progress(sdx + 1, total_segments)
             
         num_leading = len(segment["text"]) - len(segment["text"].lstrip())
         num_trailing = len(segment["text"]) - len(segment["text"].rstrip())
@@ -338,8 +335,11 @@ def align(
                 aligned_subsegments[-1]["chars"] = curr_chars
 
         aligned_subsegments = pd.DataFrame(aligned_subsegments)
-        aligned_subsegments["start"] = interpolate_nans(aligned_subsegments["start"], method=interpolate_method)
-        aligned_subsegments["end"] = interpolate_nans(aligned_subsegments["end"], method=interpolate_method)
+        # fix nans of start/end
+        seq_timecode_vals = aligned_subsegments[["start", "end"]].values.ravel("C")
+        filled_seq_timecodes = interpolate_nans(pd.Series(seq_timecode_vals), method=interpolate_method)
+        aligned_subsegments["start"] = filled_seq_timecodes.iloc[::2].values
+        aligned_subsegments["end"] = filled_seq_timecodes.iloc[1::2].values
         # concatenate sentences with same timestamps
         agg_dict = {"text": " ".join, "words": "sum"}
         if model_lang in LANGUAGES_WITHOUT_SPACES:
