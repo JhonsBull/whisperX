@@ -6,6 +6,19 @@ import warnings
 import numpy as np
 import torch
 
+# Configurações de reprodutibilidade
+random_seed = 0
+random = __import__('random')  # para evitar conflitos de nomes
+random.seed(random_seed)
+np.random.seed(random_seed)
+torch.manual_seed(random_seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(random_seed)
+
+# Desativar TensorFloat-32 para maior precisão e reprodutibilidade
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+
 from .alignment import align, load_align_model
 from .asr import load_model
 from .audio import load_audio
@@ -19,7 +32,6 @@ from .utils import (
     optional_int,
     str2bool,
 )
-
 
 def cli():
     # fmt: off
@@ -84,7 +96,7 @@ def cli():
 
     parser.add_argument("--print_progress", type=str2bool, default = False, help = "if True, progress will be printed in transcribe() and align() methods.")
     # fmt: on
-
+    
     args = parser.parse_args().__dict__
     model_name: str = args.pop("model")
     batch_size: int = args.pop("batch_size")
@@ -94,7 +106,6 @@ def cli():
     device: str = args.pop("device")
     device_index: int = args.pop("device_index")
     compute_type: str = args.pop("compute_type")
-    verbose: bool = args.pop("verbose")
 
     # model_flush: bool = args.pop("model_flush")
     os.makedirs(output_dir, exist_ok=True)
@@ -102,7 +113,7 @@ def cli():
     align_model: str = args.pop("align_model")
     interpolate_method: str = args.pop("interpolate_method")
     no_align: bool = args.pop("no_align")
-    task: str = args.pop("task")
+    task : str = args.pop("task")
     if task == "translate":
         # translation cannot be aligned
         no_align = True
@@ -181,13 +192,7 @@ def cli():
         audio = load_audio(audio_path)
         # >> VAD & ASR
         print(">>Performing transcription...")
-        result: TranscriptionResult = model.transcribe(
-            audio,
-            batch_size=batch_size,
-            chunk_size=chunk_size,
-            print_progress=print_progress,
-            verbose=verbose,
-        )
+        result = model.transcribe(audio, batch_size=batch_size, chunk_size=chunk_size, print_progress=print_progress)
         results.append((result, audio_path))
 
     # Unload Whisper and VAD
@@ -214,16 +219,7 @@ def cli():
                     print(f"New language found ({result['language']})! Previous was ({align_metadata['language']}), loading new alignment model for new language...")
                     align_model, align_metadata = load_align_model(result["language"], device)
                 print(">>Performing alignment...")
-                result: AlignedTranscriptionResult = align(
-                    result["segments"],
-                    align_model,
-                    align_metadata,
-                    input_audio,
-                    device,
-                    interpolate_method=interpolate_method,
-                    return_char_alignments=return_char_alignments,
-                    print_progress=print_progress,
-                )
+                result = align(result["segments"], align_model, align_metadata, input_audio, device, interpolate_method=interpolate_method, return_char_alignments=return_char_alignments, print_progress=print_progress)
 
             results.append((result, audio_path))
 
