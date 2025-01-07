@@ -1,307 +1,394 @@
-import hashlib
 import os
-import urllib
-from typing import Callable, Optional, Text, Union
+import warnings
+from typing import List, Union, Optional, NamedTuple, Callable
+from enum import Enum
 
+import ctranslate2
+import faster_whisper
 import numpy as np
-import pandas as pd
 import torch
-from pyannote.audio import Model
-from pyannote.audio.core.io import AudioFile
-from pyannote.audio.pipelines import VoiceActivityDetection
-from pyannote.audio.pipelines.utils import PipelineModel
-from pyannote.core import Annotation, Segment, SlidingWindowFeature
-from tqdm import tqdm
+from transformers import Pipeline
+from transformers.pipelines.pt_utils import PipelineIterator
 
-from .diarize import Segment as SegmentX
+from .audio import N_SAMPLES, SAMPLE_RATE, load_audio, log_mel_spectrogram
+from .vad import load_vad_model, merge_chunks
+from .types import TranscriptionResult, SingleSegment
 
-# deprecated
-VAD_SEGMENTATION_URL = "https://whisperx.s3.eu-west-2.amazonaws.com/model_weights/segmentation/0b5b3216d60a2d32fc086b47ea8c67589aaeb26b7e07fcbe620d6d0b83e209ea/pytorch_model.bin"
+def find_numeral_symbol_tokens(tokenizer):
+    numeral_symbol_tokens = []
+    for i in range(tokenizer.eot):
+        token = tokenizer.decode([i]).removeprefix(" ")
+        has_numeral_symbol = any(c in "0123456789%$£" for c in token)
+        if has_numeral_symbol:
+            numeral_symbol_tokens.append(i)
+    return numeral_symbol_tokens
 
-def load_vad_model(device, vad_onset=0.500, vad_offset=0.363, use_auth_token=None, model_fp=None):
-    model_dir = torch.hub._get_torch_home()
+class WhisperModel(faster_whisper.WhisperModel):
+    '''
+    FasterWhisperModel provides batched inference for faster-whisper.
+    Currently only works in non-timestamp mode and fixed prompt for all samples in batch.
+    '''
 
-    vad_dir = os.path.dirname(os.path.abspath(__file__))
-
-    os.makedirs(model_dir, exist_ok = True)
-    if model_fp is None:
-        # Dynamically resolve the path to the model file
-        model_fp = os.path.join(vad_dir, "assets", "pytorch_model.bin")
-        model_fp = os.path.abspath(model_fp)  # Ensure the path is absolute
-    else:
-        model_fp = os.path.abspath(model_fp)  # Ensure any provided path is absolute
-    
-    # Check if the resolved model file exists
-    if not os.path.exists(model_fp):
-        raise FileNotFoundError(f"Model file not found at {model_fp}")
-    
-    if os.path.exists(model_fp) and not os.path.isfile(model_fp):
-        raise RuntimeError(f"{model_fp} exists and is not a regular file")
-
-    model_bytes = open(model_fp, "rb").read()
-    if hashlib.sha256(model_bytes).hexdigest() != VAD_SEGMENTATION_URL.split('/')[-2]:
-        raise RuntimeError(
-            "Model has been downloaded but the SHA256 checksum does not match. Please retry loading the model."
+    def generate_segment_batched(self, features: np.ndarray, tokenizer: faster_whisper.tokenizer.Tokenizer, options: faster_whisper.transcribe.TranscriptionOptions, encoder_output = None):
+        batch_size = features.shape[0]
+        all_tokens = []
+        prompt_reset_since = 0
+        if options.initial_prompt is not None:
+            initial_prompt = " " + options.initial_prompt.strip()
+            initial_prompt_tokens = tokenizer.encode(initial_prompt)
+            all_tokens.extend(initial_prompt_tokens)
+        previous_tokens = all_tokens[prompt_reset_since:]
+        prompt = self.get_prompt(
+            tokenizer,
+            previous_tokens,
+            without_timestamps=options.without_timestamps,
+            prefix=options.prefix,
         )
 
-    vad_model = Model.from_pretrained(model_fp, use_auth_token=use_auth_token)
-    hyperparameters = {"onset": vad_onset, 
-                    "offset": vad_offset,
-                    "min_duration_on": 0.1,
-                    "min_duration_off": 0.1}
-    vad_pipeline = VoiceActivitySegmentation(segmentation=vad_model, device=torch.device(device))
-    vad_pipeline.instantiate(hyperparameters)
+        encoder_output = self.encode(features)
 
-    return vad_pipeline
+        max_initial_timestamp_index = int(
+            round(options.max_initial_timestamp / self.time_precision)
+        )
 
-class Binarize:
-    """Binarize detection scores using hysteresis thresholding, with min-cut operation
-    to ensure not segments are longer than max_duration.
+        result = self.model.generate(
+                encoder_output,
+                [prompt] * batch_size,
+                beam_size=options.beam_size,
+                patience=options.patience,
+                length_penalty=options.length_penalty,
+                max_length=self.max_length,
+                suppress_blank=options.suppress_blank,
+                suppress_tokens=options.suppress_tokens,
+            )
 
-    Parameters
-    ----------
-    onset : float, optional
-        Onset threshold. Defaults to 0.5.
-    offset : float, optional
-        Offset threshold. Defaults to `onset`.
-    min_duration_on : float, optional
-        Remove active regions shorter than that many seconds. Defaults to 0s.
-    min_duration_off : float, optional
-        Fill inactive regions shorter than that many seconds. Defaults to 0s.
-    pad_onset : float, optional
-        Extend active regions by moving their start time by that many seconds.
-        Defaults to 0s.
-    pad_offset : float, optional
-        Extend active regions by moving their end time by that many seconds.
-        Defaults to 0s.
-    max_duration: float
-        The maximum length of an active segment, divides segment at timestamp with lowest score.
-    Reference
-    ---------
-    Gregory Gelly and Jean-Luc Gauvain. "Minimum Word Error Training of
-    RNN-based Voice Activity Detection", InterSpeech 2015.
+        tokens_batch = [x.sequences_ids[0] for x in result]
 
-    Modified by Max Bain to include WhisperX's min-cut operation 
-    https://arxiv.org/abs/2303.00747
-    
-    Pyannote-audio
+        def decode_batch(tokens: List[List[int]]) -> str:
+            res = []
+            for tk in tokens:
+                res.append([token for token in tk if token < tokenizer.eot])
+            # text_tokens = [token for token in tokens if token < self.eot]
+            return tokenizer.tokenizer.decode_batch(res)
+
+        text = decode_batch(tokens_batch)
+
+        return text
+
+    def encode(self, features: np.ndarray) -> ctranslate2.StorageView:
+        # When the model is running on multiple GPUs, the encoder output should be moved
+        # to the CPU since we don't know which GPU will handle the next job.
+        to_cpu = self.model.device == "cuda" and len(self.model.device_index) > 1
+        # unsqueeze if batch size = 1
+        if len(features.shape) == 2:
+            features = np.expand_dims(features, 0)
+        features = faster_whisper.transcribe.get_ctranslate2_storage(features)
+
+        return self.model.encode(features, to_cpu=to_cpu)
+
+class FasterWhisperPipeline(Pipeline):
     """
+    Huggingface Pipeline wrapper for FasterWhisperModel.
+    """
+    # TODO:
+    # - add support for timestamp mode
+    # - add support for custom inference kwargs
+
+    class TranscriptionState(Enum):
+        LOADING_AUDIO = "loading_audio"
+        GENERATING_VAD_SEGMENTS = "generating_vad_segments"
+        TRANSCRIBING = "transcribing"
+        FINISHED = "finished"
 
     def __init__(
-        self,
-        onset: float = 0.5,
-        offset: Optional[float] = None,
-        min_duration_on: float = 0.0,
-        min_duration_off: float = 0.0,
-        pad_onset: float = 0.0,
-        pad_offset: float = 0.0,
-        max_duration: float = float('inf')
+            self,
+            model,
+            vad,
+            vad_params: dict,
+            options : NamedTuple,
+            tokenizer=None,
+            device: Union[int, str, "torch.device"] = -1,
+            framework = "pt",
+            language : Optional[str] = None,
+            suppress_numerals: bool = False,
+            **kwargs
     ):
-
-        super().__init__()
-
-        self.onset = onset
-        self.offset = offset or onset
-
-        self.pad_onset = pad_onset
-        self.pad_offset = pad_offset
-
-        self.min_duration_on = min_duration_on
-        self.min_duration_off = min_duration_off
-
-        self.max_duration = max_duration
-
-    def __call__(self, scores: SlidingWindowFeature) -> Annotation:
-        """Binarize detection scores
-        Parameters
-        ----------
-        scores : SlidingWindowFeature
-            Detection scores.
-        Returns
-        -------
-        active : Annotation
-            Binarized scores.
-        """
-
-        num_frames, num_classes = scores.data.shape
-        frames = scores.sliding_window
-        timestamps = [frames[i].middle for i in range(num_frames)]
-
-        # annotation meant to store 'active' regions
-        active = Annotation()
-        for k, k_scores in enumerate(scores.data.T):
-
-            label = k if scores.labels is None else scores.labels[k]
-
-            # initial state
-            start = timestamps[0]
-            is_active = k_scores[0] > self.onset
-            curr_scores = [k_scores[0]]
-            curr_timestamps = [start]
-            t = start
-            for t, y in zip(timestamps[1:], k_scores[1:]):
-                # currently active
-                if is_active: 
-                    curr_duration = t - start
-                    if curr_duration > self.max_duration:
-                        search_after = len(curr_scores) // 2
-                        # divide segment
-                        min_score_div_idx = search_after + np.argmin(curr_scores[search_after:])
-                        min_score_t = curr_timestamps[min_score_div_idx]
-                        region = Segment(start - self.pad_onset, min_score_t + self.pad_offset)
-                        active[region, k] = label
-                        start = curr_timestamps[min_score_div_idx]
-                        curr_scores = curr_scores[min_score_div_idx+1:]
-                        curr_timestamps = curr_timestamps[min_score_div_idx+1:]
-                    # switching from active to inactive
-                    elif y < self.offset:
-                        region = Segment(start - self.pad_onset, t + self.pad_offset)
-                        active[region, k] = label
-                        start = t
-                        is_active = False
-                        curr_scores = []
-                        curr_timestamps = []
-                    curr_scores.append(y)
-                    curr_timestamps.append(t)
-                # currently inactive
-                else:
-                    # switching from inactive to active
-                    if y > self.onset:
-                        start = t
-                        is_active = True
-
-            # if active at the end, add final region
-            if is_active:
-                region = Segment(start - self.pad_onset, t + self.pad_offset)
-                active[region, k] = label
-
-        # because of padding, some active regions might be overlapping: merge them.
-        # also: fill same speaker gaps shorter than min_duration_off
-        if self.pad_offset > 0.0 or self.pad_onset > 0.0 or self.min_duration_off > 0.0:
-            if self.max_duration < float("inf"):
-                raise NotImplementedError(f"This would break current max_duration param")
-            active = active.support(collar=self.min_duration_off)
-
-        # remove tracks shorter than min_duration_on
-        if self.min_duration_on > 0:
-            for segment, track in list(active.itertracks()):
-                if segment.duration < self.min_duration_on:
-                    del active[segment, track]
-
-        return active
-
-
-class VoiceActivitySegmentation(VoiceActivityDetection):
-    def __init__(
-        self,
-        segmentation: PipelineModel = "pyannote/segmentation",
-        fscore: bool = False,
-        use_auth_token: Union[Text, None] = None,
-        **inference_kwargs,
-    ):
-
-        super().__init__(segmentation=segmentation, fscore=fscore, use_auth_token=use_auth_token, **inference_kwargs)
-
-    def apply(self, file: AudioFile, hook: Optional[Callable] = None) -> Annotation:
-        """Apply voice activity detection
-
-        Parameters
-        ----------
-        file : AudioFile
-            Processed file.
-        hook : callable, optional
-            Hook called after each major step of the pipeline with the following
-            signature: hook("step_name", step_artefact, file=file)
-
-        Returns
-        -------
-        speech : Annotation
-            Speech regions.
-        """
-
-        # setup hook (e.g. for debugging purposes)
-        hook = self.setup_hook(file, hook=hook)
-
-        # apply segmentation model (only if needed)
-        # output shape is (num_chunks, num_frames, 1)
-        if self.training:
-            if self.CACHED_SEGMENTATION in file:
-                segmentations = file[self.CACHED_SEGMENTATION]
+        self.model = model
+        self.tokenizer = tokenizer
+        self.options = options
+        self.preset_language = language
+        self.suppress_numerals = suppress_numerals
+        self._batch_size = kwargs.pop("batch_size", None)
+        self._num_workers = 1
+        self._preprocess_params, self._forward_params, self._postprocess_params = self._sanitize_parameters(**kwargs)
+        self.call_count = 0
+        self.framework = framework
+        if self.framework == "pt":
+            if isinstance(device, torch.device):
+                self.device = device
+            elif isinstance(device, str):
+                self.device = torch.device(device)
+            elif device < 0:
+                self.device = torch.device("cpu")
             else:
-                segmentations = self._segmentation(file)
-                file[self.CACHED_SEGMENTATION] = segmentations
+                self.device = torch.device(f"cuda:{device}")
         else:
-            segmentations: SlidingWindowFeature = self._segmentation(file)
+            self.device = device
 
-        return segmentations
+        super(Pipeline, self).__init__()
+        self.vad_model = vad
+        self._vad_params = vad_params
+
+    def _sanitize_parameters(self, **kwargs):
+        preprocess_kwargs = {}
+        if "tokenizer" in kwargs:
+            preprocess_kwargs["maybe_arg"] = kwargs["maybe_arg"]
+        return preprocess_kwargs, {}, {}
+
+    def preprocess(self, audio):
+        audio = audio['inputs']
+        model_n_mels = self.model.feat_kwargs.get("feature_size")
+        features = log_mel_spectrogram(
+            audio,
+            n_mels=model_n_mels if model_n_mels is not None else 80,
+            padding=N_SAMPLES - audio.shape[0],
+        )
+        return {'inputs': features}
+
+    def _forward(self, model_inputs):
+        outputs = self.model.generate_segment_batched(model_inputs['inputs'], self.tokenizer, self.options)
+        return {'text': outputs}
+
+    def postprocess(self, model_outputs):
+        return model_outputs
+
+    def get_iterator(
+        self, inputs, num_workers: int, batch_size: int, preprocess_params, forward_params, postprocess_params
+    ):
+        dataset = PipelineIterator(inputs, self.preprocess, preprocess_params)
+        if "TOKENIZERS_PARALLELISM" not in os.environ:
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        # TODO hack by collating feature_extractor and image_processor
+
+        def stack(items):
+            return {'inputs': torch.stack([x['inputs'] for x in items])}
+        dataloader = torch.utils.data.DataLoader(dataset, num_workers=num_workers, batch_size=batch_size, collate_fn=stack)
+        model_iterator = PipelineIterator(dataloader, self.forward, forward_params, loader_batch_size=batch_size)
+        final_iterator = PipelineIterator(model_iterator, self.postprocess, postprocess_params)
+        return final_iterator
+
+    def transcribe(
+            self,
+            audio: Union[str, np.ndarray],
+            batch_size=None,
+            num_workers=0,
+            language=None,
+            task=None,
+            chunk_size=30,
+            on_progress: Callable[[TranscriptionState, Optional[int], Optional[int]], None] = None,
+            print_progress: bool = False,
+            combined_progress: bool = False
+    ) -> TranscriptionResult:
+        if isinstance(audio, str):
+            if on_progress:
+                on_progress(self.__class__.TranscriptionState.LOADING_AUDIO)
+
+            audio = load_audio(audio)
+
+        def data(audio, segments):
+            for seg in segments:
+                f1 = int(seg['start'] * SAMPLE_RATE)
+                f2 = int(seg['end'] * SAMPLE_RATE)
+                # print(f2-f1)
+                yield {'inputs': audio[f1:f2]}
+
+        if on_progress:
+            on_progress(self.__class__.TranscriptionState.GENERATING_VAD_SEGMENTS)
+
+        vad_segments = self.vad_model({"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": SAMPLE_RATE})
+        vad_segments = merge_chunks(
+            vad_segments,
+            chunk_size,
+            onset=self._vad_params["vad_onset"],
+            offset=self._vad_params["vad_offset"],
+        )
+
+        if self.tokenizer is None:
+            language = language or self.detect_language(audio)
+            task = task or "transcribe"
+            self.tokenizer = faster_whisper.tokenizer.Tokenizer(self.model.hf_tokenizer,
+                                                                self.model.model.is_multilingual, task=task,
+                                                                language=language)
+        else:
+            language = language or self.tokenizer.language_code
+            task = task or self.tokenizer.task
+            if task != self.tokenizer.task or language != self.tokenizer.language_code:
+                self.tokenizer = faster_whisper.tokenizer.Tokenizer(self.model.hf_tokenizer,
+                                                                    self.model.model.is_multilingual, task=task,
+                                                                    language=language)
+                
+        if self.suppress_numerals:
+            previous_suppress_tokens = self.options.suppress_tokens
+            numeral_symbol_tokens = find_numeral_symbol_tokens(self.tokenizer)
+            print(f"Suppressing numeral and symbol tokens")
+            new_suppressed_tokens = numeral_symbol_tokens + self.options.suppress_tokens
+            new_suppressed_tokens = list(set(new_suppressed_tokens))
+            self.options = self.options._replace(suppress_tokens=new_suppressed_tokens)
+
+        segments: List[SingleSegment] = []
+        batch_size = batch_size or self._batch_size
+        total_segments = len(vad_segments)
+
+        if on_progress:
+            on_progress(self.__class__.TranscriptionState.TRANSCRIBING, 0, total_segments)
+
+        for idx, out in enumerate(self.__call__(data(audio, vad_segments), batch_size=batch_size, num_workers=num_workers)):
+            # Original print-only behaviour to keep the method backwards compatible
+            # Should probably be replaced with a default on_progress callback some-when.
+            if print_progress:
+                base_progress = ((idx + 1) / total_segments) * 100
+                percent_complete = base_progress / 2 if combined_progress else base_progress
+                print(f"Progress: {percent_complete:.2f}%...")
+
+            if on_progress:
+                on_progress(self.__class__.TranscriptionState.TRANSCRIBING, idx + 1, total_segments)
+
+            text = out['text']
+            if batch_size in [0, 1, None]:
+                text = text[0]
+            segments.append(
+                {
+                    "text": text,
+                    "start": round(vad_segments[idx]['start'], 3),
+                    "end": round(vad_segments[idx]['end'], 3)
+                }
+            )
+
+        if on_progress:
+            on_progress(self.__class__.TranscriptionState.FINISHED)
+
+        # revert the tokenizer if multilingual inference is enabled
+        if self.preset_language is None:
+            self.tokenizer = None
+
+        # revert suppressed tokens if suppress_numerals is enabled
+        if self.suppress_numerals:
+            self.options = self.options._replace(suppress_tokens=previous_suppress_tokens)
+
+        return {"segments": segments, "language": language}
 
 
-def merge_vad(vad_arr, pad_onset=0.0, pad_offset=0.0, min_duration_off=0.0, min_duration_on=0.0):
+    def detect_language(self, audio: np.ndarray):
+        if audio.shape[0] < N_SAMPLES:
+            print("Warning: audio is shorter than 30s, language detection may be inaccurate.")
+        model_n_mels = self.model.feat_kwargs.get("feature_size")
+        segment = log_mel_spectrogram(audio[: N_SAMPLES],
+                                      n_mels=model_n_mels if model_n_mels is not None else 80,
+                                      padding=0 if audio.shape[0] >= N_SAMPLES else N_SAMPLES - audio.shape[0])
+        encoder_output = self.model.encode(segment)
+        results = self.model.model.detect_language(encoder_output)
+        language_token, language_probability = results[0][0]
+        language = language_token[2:-2]
+        print(f"Detected language: {language} ({language_probability:.2f}) in first 30s of audio...")
+        return language
 
-    active = Annotation()
-    for k, vad_t in enumerate(vad_arr):
-        region = Segment(vad_t[0] - pad_onset, vad_t[1] + pad_offset)
-        active[region, k] = 1
+def load_model(whisper_arch,
+               device,
+               device_index=0,
+               compute_type="float16",
+               asr_options=None,
+               language : Optional[str] = None,
+               vad_model=None,
+               vad_options=None,
+               model : Optional[WhisperModel] = None,
+               task="transcribe",
+               download_root=None,
+               threads=4):
+    '''Load a Whisper model for inference.
+    Args:
+        whisper_arch: str - The name of the Whisper model to load.
+        device: str - The device to load the model on.
+        compute_type: str - The compute type to use for the model.
+        options: dict - A dictionary of options to use for the model.
+        language: str - The language of the model. (use English for now)
+        model: Optional[WhisperModel] - The WhisperModel instance to use.
+        download_root: Optional[str] - The root directory to download the model to.
+        threads: int - The number of cpu threads to use per worker, e.g. will be multiplied by num workers.
+    Returns:
+        A Whisper pipeline.
+    '''
 
+    if whisper_arch.endswith(".en"):
+        language = "en"
 
-    if pad_offset > 0.0 or pad_onset > 0.0 or min_duration_off > 0.0:
-        active = active.support(collar=min_duration_off)
-    
-    # remove tracks shorter than min_duration_on
-    if min_duration_on > 0:
-        for segment, track in list(active.itertracks()):
-            if segment.duration < min_duration_on:
-                    del active[segment, track]
-    
-    active = active.for_json()
-    active_segs = pd.DataFrame([x['segment'] for x in active['content']])
-    return active_segs
+    model = model or WhisperModel(whisper_arch,
+                         device=device,
+                         device_index=device_index,
+                         compute_type=compute_type,
+                         download_root=download_root,
+                         cpu_threads=threads)
+    if language is not None:
+        tokenizer = faster_whisper.tokenizer.Tokenizer(model.hf_tokenizer, model.model.is_multilingual, task=task, language=language)
+    else:
+        print("No language specified, language will be first be detected for each audio file (increases inference time).")
+        tokenizer = None
 
-def merge_chunks(
-    segments,
-    chunk_size,
-    onset: float = 0.5,
-    offset: Optional[float] = None,
-):
-    """
-    Merge operation described in paper
-    """
-    curr_end = 0
-    merged_segments = []
-    seg_idxs = []
-    speaker_idxs = []
+    default_asr_options =  {
+        "beam_size": 5,
+        "best_of": 5,
+        "patience": 1,
+        "length_penalty": 1,
+        "repetition_penalty": 1,
+        "no_repeat_ngram_size": 0,
+        "temperatures": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        "compression_ratio_threshold": 2.4,
+        "log_prob_threshold": -1.0,
+        "no_speech_threshold": 0.6,
+        "condition_on_previous_text": False,
+        "prompt_reset_on_temperature": 0.5,
+        "initial_prompt": None,
+        "prefix": None,
+        "suppress_blank": True,
+        "suppress_tokens": [-1],
+        "without_timestamps": True,
+        "max_initial_timestamp": 0.0,
+        "word_timestamps": False,
+        "prepend_punctuations": "\"'“¿([{-",
+        "append_punctuations": "\"'.。,，!！?？:：”)]}、",
+        "suppress_numerals": False,
+        "max_new_tokens": None,
+        "clip_timestamps": None,
+        "hallucination_silence_threshold": None,
+        "hotwords": None,
+    }
 
-    assert chunk_size > 0
-    binarize = Binarize(max_duration=chunk_size, onset=onset, offset=offset)
-    segments = binarize(segments)
-    segments_list = []
-    for speech_turn in segments.get_timeline():
-        segments_list.append(SegmentX(speech_turn.start, speech_turn.end, "UNKNOWN"))
+    if asr_options is not None:
+        default_asr_options.update(asr_options)
 
-    if len(segments_list) == 0:
-        print("No active speech found in audio")
-        return []
-    # assert segments_list, "segments_list is empty."
-    # Make sur the starting point is the start of the segment.
-    curr_start = segments_list[0].start
+    suppress_numerals = default_asr_options["suppress_numerals"]
+    del default_asr_options["suppress_numerals"]
 
-    for seg in segments_list:
-        if seg.end - curr_start > chunk_size and curr_end-curr_start > 0:
-            merged_segments.append({
-                "start": curr_start,
-                "end": curr_end,
-                "segments": seg_idxs,
-            })
-            curr_start = seg.start
-            seg_idxs = []
-            speaker_idxs = []
-        curr_end = seg.end
-        seg_idxs.append((seg.start, seg.end))
-        speaker_idxs.append(seg.speaker)
-    # add final
-    merged_segments.append({ 
-                "start": curr_start,
-                "end": curr_end,
-                "segments": seg_idxs,
-            })    
-    return merged_segments
+    default_asr_options = faster_whisper.transcribe.TranscriptionOptions(**default_asr_options)
+
+    default_vad_options = {
+        "vad_onset": 0.500,
+        "vad_offset": 0.363
+    }
+
+    if vad_options is not None:
+        default_vad_options.update(vad_options)
+
+    if vad_model is not None:
+        vad_model = vad_model
+    else:
+        vad_model = load_vad_model(torch.device(device), use_auth_token=None, **default_vad_options)
+
+    return FasterWhisperPipeline(
+        model=model,
+        vad=vad_model,
+        options=default_asr_options,
+        tokenizer=tokenizer,
+        language=language,
+        suppress_numerals=suppress_numerals,
+        vad_params=default_vad_options,
+    )
